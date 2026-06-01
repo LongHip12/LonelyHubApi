@@ -128,16 +128,16 @@ def make_v2_endpoint(endpoint_name):
         embeds = body.get("embeds")
         if not embeds or not isinstance(embeds, list) or len(embeds) == 0:
             print(f"[Warning] Non-embed payload rejected on /api/v2/send/{endpoint_name}")
-            return jsonify({"source": "python 3.15", "success": False, "error": "Only embed payloads are accepted. Send {'embeds': [...]}"}), 400
+            return jsonify({"source": "python 3.15", "success": False, "error": "An unknown error has occurred."}), 400
 
         for key in body:
             if key not in ("embeds", "username", "avatar_url"):
                 print(f"[Warning] Extra field '{key}' rejected on /api/v2/send/{endpoint_name}")
-                return jsonify({"source": "python 3.15", "success": False, "error": f"Only embeds are allowed. Field '{key}' is not permitted"}), 400
+                return jsonify({"source": "python 3.15", "success": False, "error": f"An unknown error has occurred"}), 400
 
         if contains_banned_words(embeds):
             print(f"[Warning] Banned word detected in embed on /api/v2/send/{endpoint_name}")
-            return jsonify({"source": "python 3.15", "success": False, "error": "Embed contains banned words (@here, @everyone)"}), 400
+            return jsonify({"source": "python 3.15", "success": False, "error": "An unknown error has occurred"}), 400
 
         webhook_url = WEBHOOK_MAP.get(endpoint_name)
         if not webhook_url:
