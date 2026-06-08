@@ -47,6 +47,13 @@
     resultBox.classList.add('show');
   }
 
+  const clearBtn = document.getElementById('btn-clear-log');
+  if (clearBtn) {
+    clearBtn.addEventListener('click', () => {
+      if (logConsole) logConsole.innerHTML = '';
+    });
+  }
+
   const createBtn = document.getElementById('btn-create-api');
   if (createBtn) {
     createBtn.addEventListener('click', async () => {
