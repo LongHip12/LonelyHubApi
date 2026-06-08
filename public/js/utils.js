@@ -1,7 +1,8 @@
 window.api = {
   async get(path) {
     const r = await fetch(path, { credentials: 'include' });
-    return r.json();
+    const text = await r.text();
+    try { return JSON.parse(text); } catch { return { error: 'Server error ' + r.status }; }
   },
   async post(path, body) {
     const r = await fetch(path, {
@@ -10,7 +11,8 @@ window.api = {
       credentials: 'include',
       body: JSON.stringify(body),
     });
-    return r.json();
+    const text = await r.text();
+    try { return JSON.parse(text); } catch { return { error: 'Server error ' + r.status }; }
   },
   async put(path, body) {
     const r = await fetch(path, {
@@ -19,11 +21,13 @@ window.api = {
       credentials: 'include',
       body: JSON.stringify(body),
     });
-    return r.json();
+    const text = await r.text();
+    try { return JSON.parse(text); } catch { return { error: 'Server error ' + r.status }; }
   },
   async del(path) {
     const r = await fetch(path, { method: 'DELETE', credentials: 'include' });
-    return r.json();
+    const text = await r.text();
+    try { return JSON.parse(text); } catch { return { error: 'Server error ' + r.status }; }
   },
 };
 
@@ -74,6 +78,83 @@ window.formatJson = function (obj) {
   return JSON.stringify(obj, null, 2);
 };
 
+function makeCustomSelect(selectEl) {
+  if (!selectEl || selectEl.dataset.customized) return;
+  selectEl.dataset.customized = '1';
+
+  const wrapper = document.createElement('div');
+  wrapper.className = 'custom-select-wrapper';
+
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'custom-select-btn';
+
+  const dropdown = document.createElement('div');
+  dropdown.className = 'custom-select-dropdown';
+
+  selectEl.parentNode.insertBefore(wrapper, selectEl);
+  wrapper.appendChild(btn);
+  wrapper.appendChild(dropdown);
+  wrapper.appendChild(selectEl);
+
+  function syncOptions() {
+    dropdown.innerHTML = '';
+    Array.from(selectEl.options).forEach((opt, i) => {
+      const item = document.createElement('div');
+      item.className = 'custom-select-option' + (i === selectEl.selectedIndex ? ' selected' : '');
+      item.textContent = opt.text;
+      item.dataset.value = opt.value;
+      item.addEventListener('click', (e) => {
+        e.stopPropagation();
+        selectEl.value = opt.value;
+        selectEl.dispatchEvent(new Event('change', { bubbles: true }));
+        btn.textContent = opt.text;
+        dropdown.querySelectorAll('.custom-select-option').forEach(o => o.classList.remove('selected'));
+        item.classList.add('selected');
+        close();
+      });
+      dropdown.appendChild(item);
+    });
+    const sel = selectEl.options[selectEl.selectedIndex];
+    btn.textContent = sel ? sel.text : '';
+  }
+
+  function open() {
+    wrapper.classList.add('open');
+    dropdown.classList.add('open');
+  }
+
+  function close() {
+    wrapper.classList.remove('open');
+    dropdown.classList.remove('open');
+  }
+
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const isOpen = dropdown.classList.contains('open');
+    document.querySelectorAll('.custom-select-dropdown.open').forEach(d => {
+      d.classList.remove('open');
+      d.closest('.custom-select-wrapper')?.classList.remove('open');
+    });
+    if (!isOpen) open();
+  });
+
+  document.addEventListener('click', () => close());
+
+  syncOptions();
+
+  const observer = new MutationObserver(() => syncOptions());
+  observer.observe(selectEl, { childList: true, attributes: true, subtree: true });
+}
+
+window.makeCustomSelect = makeCustomSelect;
+
+function customizeAllSelects(root) {
+  (root || document).querySelectorAll('select:not([data-customized])').forEach(makeCustomSelect);
+}
+
+window.customizeAllSelects = customizeAllSelects;
+
 const CUSTOM_ENCODE_TEMPLATE = `{
   "a": "", "b": "", "c": "", "d": "", "e": "",
   "f": "", "g": "", "h": "", "i": "", "j": "",
@@ -109,7 +190,7 @@ function buildFormFields(container, data) {
     if (f.withRandom) {
       g.innerHTML += `<div class="form-row">
         <input type="${f.type}" id="${f.id}" placeholder="${f.placeholder}" value="${f.value}">
-        <button class="btn btn-ghost btn-icon" id="btn-random-id" title="Generate random ID">
+        <button type="button" class="btn btn-ghost btn-icon" id="btn-random-id" title="Generate random ID">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/></svg>
         </button>
       </div>`;
@@ -124,9 +205,9 @@ function buildFormFields(container, data) {
   toggleEmptyGroup.innerHTML = `
     <div class="toggle-group">
       <span class="toggle-label">Empty Value</span>
-      <label class="toggle"><input type="checkbox" id="f-emptyValue" ${data?.emptyValue !== false ? 'checked' : ''}><span class="toggle-slider"></span></label>
+      <label class="toggle"><input type="checkbox" id="f-emptyValue" ${data?.emptyValue ? 'checked' : ''}><span class="toggle-slider"></span></label>
     </div>
-    <div id="default-value-group" class="form-group" style="margin-top:10px;display:${data?.emptyValue !== false ? 'none' : 'block'}">
+    <div id="default-value-group" class="form-group" style="margin-top:10px;display:${data?.emptyValue ? 'none' : 'block'}">
       <label>Default Value (JSON)</label>
       <textarea id="f-defaultValue" placeholder='{"key": "value"}'>${data?.defaultValue ? JSON.stringify(data.defaultValue, null, 2) : ''}</textarea>
     </div>
@@ -135,10 +216,14 @@ function buildFormFields(container, data) {
 
   const visGroup = document.createElement('div');
   visGroup.className = 'form-group';
+  const visCur = data?.visibility || 'Public';
   visGroup.innerHTML = `
     <label>Visibility</label>
-    <select id="f-visibility"><option value="Public" ${data?.visibility !== 'Private' ? 'selected' : ''}>Public</option><option value="Private" ${data?.visibility === 'Private' ? 'selected' : ''}>Private</option></select>
-    <div id="whitelist-group" style="margin-top:10px;display:${data?.visibility === 'Private' ? 'block' : 'none'}">
+    <select id="f-visibility">
+      <option value="Public" ${visCur !== 'Private' ? 'selected' : ''}>Public</option>
+      <option value="Private" ${visCur === 'Private' ? 'selected' : ''}>Private</option>
+    </select>
+    <div id="whitelist-group" style="margin-top:10px;display:${visCur === 'Private' ? 'block' : 'none'}">
       <label>Whitelist IPs (comma separated)</label>
       <input type="text" id="f-whitelistIps" placeholder="1.2.3.4, 5.6.7.8" value="${(data?.whitelistIps || []).join(', ')}">
     </div>
@@ -160,6 +245,7 @@ function buildFormFields(container, data) {
   `;
   container.appendChild(toggleDupGroup);
 
+  const encodeMethodCur = data?.encodeMethod || 'Base64';
   const encodeGroup = document.createElement('div');
   encodeGroup.className = 'form-group';
   encodeGroup.innerHTML = `
@@ -173,16 +259,16 @@ function buildFormFields(container, data) {
         <div class="form-group">
           <label>Encode Method</label>
           <select id="f-encodeMethod">
-            <option value="Base64" ${data?.encodeMethod === 'Base64' ? 'selected' : ''}>Base64</option>
-            <option value="Base62" ${data?.encodeMethod === 'Base62' ? 'selected' : ''}>Base62</option>
-            <option value="Base32" ${data?.encodeMethod === 'Base32' ? 'selected' : ''}>Base32</option>
-            <option value="Hex" ${data?.encodeMethod === 'Hex' ? 'selected' : ''}>Hex</option>
-            <option value="Binary" ${data?.encodeMethod === 'Binary' ? 'selected' : ''}>Binary</option>
-            <option value="Unicode Escaped" ${data?.encodeMethod === 'Unicode Escaped' ? 'selected' : ''}>Unicode Escaped</option>
-            <option value="Custom" ${data?.encodeMethod === 'Custom' ? 'selected' : ''}>Custom</option>
+            <option value="Base64" ${encodeMethodCur === 'Base64' ? 'selected' : ''}>Base64</option>
+            <option value="Base62" ${encodeMethodCur === 'Base62' ? 'selected' : ''}>Base62</option>
+            <option value="Base32" ${encodeMethodCur === 'Base32' ? 'selected' : ''}>Base32</option>
+            <option value="Hex" ${encodeMethodCur === 'Hex' ? 'selected' : ''}>Hex</option>
+            <option value="Binary" ${encodeMethodCur === 'Binary' ? 'selected' : ''}>Binary</option>
+            <option value="Unicode Escaped" ${encodeMethodCur === 'Unicode Escaped' ? 'selected' : ''}>Unicode Escaped</option>
+            <option value="Custom" ${encodeMethodCur === 'Custom' ? 'selected' : ''}>Custom</option>
           </select>
         </div>
-        <div id="custom-encode-fields" style="display:${data?.encodeMethod === 'Custom' ? 'block' : 'none'}">
+        <div id="custom-encode-fields" style="display:${encodeMethodCur === 'Custom' ? 'block' : 'none'}">
           <div class="form-group">
             <label>Prefix</label>
             <input type="text" id="f-encodePrefix" placeholder="optional prefix" value="${data?.encodePrefix ?? ''}">
@@ -200,6 +286,8 @@ function buildFormFields(container, data) {
     </div>
   `;
   container.appendChild(encodeGroup);
+
+  customizeAllSelects(container);
 
   const emptyToggle = document.getElementById('f-emptyValue');
   if (emptyToggle) {
@@ -282,3 +370,5 @@ function collectFormData() {
 
 window.buildFormFields = buildFormFields;
 window.collectFormData = collectFormData;
+
+document.addEventListener('DOMContentLoaded', () => customizeAllSelects());
