@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lonely Hub — Dashboard</title>
+<link rel="stylesheet" href="/api/static/style.css">
+</head>
+<body class="dash-body">
+<aside class="sidebar">
+  <div class="sidebar-logo">
+    <img src="https://i.imgur.com/xY7M2iE.jpeg" alt="logo">
+    <span>Lonely Hub</span>
+  </div>
+  <nav>
+    {% if role == 'admin' %}
+    <a href="/admin?type=user" class="nav-item" id="nav-user" onclick="navigate('user', event)">
+      <span class="nav-icon">👥</span> Users
+    </a>
+    {% endif %}
+    <a href="/admin?type=content" class="nav-item" id="nav-content" onclick="navigate('content', event)">
+      <span class="nav-icon">📡</span> APIs
+    </a>
+  </nav>
+  <div class="sidebar-footer">
+    <div class="user-pill">
+      <span class="role-badge role-{{ role }}">{{ role }}</span>
+      <span>{{ username }}</span>
+    </div>
+    <button class="btn-logout" onclick="logout()">Logout</button>
+  </div>
+</aside>
+
+<main class="main-content">
+  <div id="section-user" class="section" style="display:none">
+    <div class="section-header">
+      <h2>User Management</h2>
+      <button class="btn-primary" onclick="loadUsers()">Refresh</button>
+    </div>
+    <div class="table-wrap">
+      <table id="user-table">
+        <thead><tr><th>Username</th><th>Role</th><th>Created</th><th>Actions</th></tr></thead>
+        <tbody id="user-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="section-content" class="section" style="display:none">
+    <div class="section-header">
+      <h2>API Management</h2>
+      <button class="btn-primary" onclick="openCreateModal()">+ New API</button>
+    </div>
+    <div class="table-wrap">
+      <table id="api-table">
+        <thead><tr><th>ID</th><th>Name</th><th>Owner</th><th>Source</th><th>Default Value</th><th>Rate Limit</th><th>Total</th><th>Actions</th></tr></thead>
+        <tbody id="api-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</main>
+
+<div id="modal-bg" class="modal-bg" style="display:none" onclick="closeModal()">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <span id="modal-title">Create API</span>
+      <button class="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+  </div>
+</div>
+
+<script>
+const ROLE = '{{ role }}';
+let editingId = null;
+
+function getType() {
+  return new URLSearchParams(window.location.search).get('type') || (ROLE === 'admin' ? 'user' : 'content');
+}
+
+function navigate(type, e) {
+  if (e) e.preventDefault();
+  history.pushState({}, '', '/admin?type=' + type);
+  showSection(type);
+}
+
+function showSection(type) {
+  document.querySelectorAll('.section').forEach(s => s.style.display = 'none');
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  const el = document.getElementById('section-' + type);
+  const nav = document.getElementById('nav-' + type);
+  if (el) el.style.display = 'block';
+  if (nav) nav.classList.add('active');
+  if (type === 'user') loadUsers();
+  if (type === 'content') loadApis();
+}
+
+async function loadUsers() {
+  const r = await fetch('/api/admin/users');
+  if (!r.ok) return;
+  const users = await r.json();
+  const tbody = document.getElementById('user-tbody');
+  tbody.innerHTML = '';
+  users.forEach(u => {
+    const tr = document.createElement('tr');
+    const date = u.created_at ? new Date(u.created_at * 1000).toLocaleDateString() : '-';
+    tr.innerHTML = `
+      <td>${esc(u.username)}</td>
+      <td><span class="role-badge role-${u.role}">${u.role}</span></td>
+      <td>${date}</td>
+      <td class="actions">
+        <select class="role-select" onchange="setRole('${u.id}', this.value)">
+          <option value="member" ${u.role==='member'?'selected':''}>member</option>
+          <option value="manager" ${u.role==='manager'?'selected':''}>manager</option>
+          <option value="admin" ${u.role==='admin'?'selected':''}>admin</option>
+        </select>
+        <button class="btn-danger btn-sm" onclick="deleteUser('${u.id}', '${esc(u.username)}')">Delete</button>
+      </td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+async function setRole(uid, role) {
+  await fetch('/api/admin/users/' + uid + '/role', { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({role}) });
+  loadUsers();
+}
+
+async function deleteUser(uid, name) {
+  if (!confirm(`Delete user "${name}"?`)) return;
+  await fetch('/api/admin/users/' + uid, { method: 'DELETE' });
+  loadUsers();
+}
+
+async function loadApis() {
+  const r = await fetch('/api/admin/apis');
+  if (!r.ok) return;
+  const apis = await r.json();
+  const tbody = document.getElementById('api-tbody');
+  tbody.innerHTML = '';
+  if (apis.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#888">No APIs yet</td></tr>';
+    return;
+  }
+  apis.forEach(a => {
+    const tr = document.createElement('tr');
+    const dv = a.defaultValue !== null && a.defaultValue !== undefined ? JSON.stringify(a.defaultValue) : '-';
+    tr.innerHTML = `
+      <td><code>${esc(a.apiId)}</code></td>
+      <td>${esc(a.apiName)}</td>
+      <td>${esc(a.owner || '-')}</td>
+      <td>${esc(a.source || '-')}</td>
+      <td><code class="dv-cell">${esc(dv)}</code></td>
+      <td>${a.rateLimit || 30}/min</td>
+      <td>${a.total || 0}</td>
+      <td class="actions">
+        <button class="btn-secondary btn-sm" onclick="openEditModal(${JSON.stringify(a).replace(/"/g,'&quot;')})">Edit</button>
+        <button class="btn-danger btn-sm" onclick="deleteApi('${esc(a.apiId)}')">Delete</button>
+      </td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+async function deleteApi(apiId) {
+  if (!confirm(`Delete API "${apiId}"?`)) return;
+  await fetch('/api/admin/apis/' + apiId, { method: 'DELETE' });
+  loadApis();
+}
+
+function openCreateModal() {
+  editingId = null;
+  document.getElementById('modal-title').textContent = 'Create API';
+  document.getElementById('modal-body').innerHTML = apiForm({});
+  document.getElementById('modal-bg').style.display = 'flex';
+}
+
+function openEditModal(api) {
+  editingId = api.apiId;
+  document.getElementById('modal-title').textContent = 'Edit API';
+  document.getElementById('modal-body').innerHTML = apiForm(api);
+  document.getElementById('modal-bg').style.display = 'flex';
+}
+
+function apiForm(a) {
+  const dv = a.defaultValue !== null && a.defaultValue !== undefined ? JSON.stringify(a.defaultValue) : '';
+  return `
+    <div class="field"><label>API ID</label><input id="f-id" value="${esc(a.apiId||'')}" ${editingId?'readonly':''} placeholder="e.g. hi"></div>
+    <div class="field"><label>API Name</label><input id="f-name" value="${esc(a.apiName||'')}" placeholder="e.g. LongHip12"></div>
+    <div class="field"><label>Webhook URL (optional)</label><input id="f-webhook" value="${esc(a.webhook||'')}" placeholder="https://discord.com/api/webhooks/..."></div>
+    <div class="field"><label>Rate Limit (req/min)</label><input id="f-rate" type="number" value="${a.rateLimit||30}"></div>
+    <div class="field"><label>Source</label><input id="f-source" value="${esc(a.source||'')}" placeholder="e.g. python 3.15"></div>
+    <div class="field"><label>Default Value (JSON)</label><input id="f-dv" value="${esc(dv)}" placeholder='{"key": "value"}'></div>
+    <div id="form-err" class="error-msg"></div>
+    <button class="btn-primary full" onclick="submitApi()">${editingId ? 'Save' : 'Create'}</button>`;
+}
+
+async function submitApi() {
+  const apiId = document.getElementById('f-id').value.trim();
+  const apiName = document.getElementById('f-name').value.trim();
+  const webhook = document.getElementById('f-webhook').value.trim();
+  const rateLimit = parseInt(document.getElementById('f-rate').value) || 30;
+  const source = document.getElementById('f-source').value.trim();
+  const dvRaw = document.getElementById('f-dv').value.trim();
+  const err = document.getElementById('form-err');
+  err.textContent = '';
+
+  let defaultValue = null;
+  if (dvRaw) {
+    try { defaultValue = JSON.parse(dvRaw); } catch { err.textContent = 'Default Value must be valid JSON'; return; }
+  }
+
+  if (!apiId || !apiName) { err.textContent = 'API ID and Name are required'; return; }
+
+  const body = { apiId, apiName, webhook, rateLimit, source, defaultValue };
+  let r;
+  if (editingId) {
+    r = await fetch('/api/admin/apis/' + editingId, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  } else {
+    r = await fetch('/api/v3/apis', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  }
+  const d = await r.json();
+  if (!r.ok) { err.textContent = d.error || 'Failed'; return; }
+  closeModal();
+  loadApis();
+}
+
+function closeModal() {
+  document.getElementById('modal-bg').style.display = 'none';
+}
+
+async function logout() {
+  await fetch('/api/auth/logout', { method: 'POST' });
+  window.location.href = '/api/admin/login';
+}
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+showSection(getType());
+window.addEventListener('popstate', () => showSection(getType()));
+</script>
+</body>
+</html>
