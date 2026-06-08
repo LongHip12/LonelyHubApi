@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lonely Api - Error</title>
+<link rel="stylesheet" href="/css/main.css">
+</head>
+<body>
+<div id="topbar"></div>
+<div id="sidebar-overlay" class="sidebar-overlay"></div>
+<div id="sidebar"></div>
+
+<div id="main-content">
+  <div class="error-page">
+    <div>
+      <div class="error-code" id="error-code">404</div>
+      <div class="error-msg" id="error-msg">Not Found</div>
+      <a href="/" class="btn btn-primary">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+        Back to Home
+      </a>
+    </div>
+  </div>
+</div>
+
+<script src="/js/utils.js"></script>
+<script src="/js/nav.js"></script>
+<script>
+(function() {
+  const p = new URLSearchParams(window.location.search);
+  const code = p.get('code') || '404';
+  const msg = p.get('msg') || 'Not Found';
+  const codeEl = document.getElementById('error-code');
+  const msgEl = document.getElementById('error-msg');
+  if (codeEl) codeEl.textContent = code;
+  if (msgEl) msgEl.textContent = decodeURIComponent(msg);
+  document.title = 'Lonely Api - Error ' + code;
+})();
+</script>
+</body>
+</html>
