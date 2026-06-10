@@ -1,565 +1,496 @@
 import os
 import json
-import secrets
-import hashlib
-import base64
 import time
-from datetime import datetime
-from functools import wraps
-from threading import Lock
-
-from flask import Flask, request, session, jsonify, send_from_directory, redirect
-
-try:
-    import bcrypt
-    _USE_BCRYPT = True
-except ImportError:
-    _USE_BCRYPT = False
-
+import threading
+import hashlib
+import functools
+import uuid
 import requests
+from flask import Flask, request, jsonify, session, redirect, render_template
 
-app = Flask(__name__, static_folder="public", static_url_path="")
-app.secret_key = os.environ.get("SESSION_SECRET", "lonely-hub-secret-key")
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["PERMANENT_SESSION_LIFETIME"] = 7 * 24 * 3600
+app = Flask(__name__, static_url_path='/api/static')
+app.secret_key = os.environ.get("SESSION_SECRET", "lonelyhub-secret-2024")
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+_wh_raw = os.environ.get("WEBHOOKS_JSON", "{}")
+try:
+    _wh_data = json.loads(_wh_raw)
+except Exception:
+    _wh_data = {}
+
+WEBHOOKS = {k: v for k, v in _wh_data.items() if k != "__execute__"}
+EXECUTE_WEBHOOK = _wh_data.get("__execute__", "")
+BLOCKED_V2 = ["@everyone", "@here", "spam", "spammed", "raidded", "@"]
+BLOCKED_V3 = ["@everyone", "@here"]
+
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-_locks: dict[str, Lock] = {}
+rate_buckets = {}
+rate_lock = threading.Lock()
 
-def _lock(name):
-    if name not in _locks:
-        _locks[name] = Lock()
-    return _locks[name]
 
-def read_json(filename):
-    path = os.path.join(DATA_DIR, filename)
+def check_rate_limit(key, max_per_minute):
+    now = time.time()
+    with rate_lock:
+        bucket = rate_buckets.get(key)
+        if not bucket or now >= bucket["reset_at"]:
+            rate_buckets[key] = {"count": 1, "reset_at": now + 60}
+            return True
+        if bucket["count"] >= max_per_minute:
+            return False
+        bucket["count"] += 1
+        return True
+
+
+def read_json(name, default):
+    path = os.path.join(DATA_DIR, f"{name}.json")
+    if not os.path.exists(path):
+        return default
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path) as f:
             return json.load(f)
     except Exception:
-        if filename == "bloxfruit.json":
-            return {"servers": {}}
-        return []
+        return default
 
-def write_json(filename, data):
-    path = os.path.join(DATA_DIR, filename)
-    with _lock(filename):
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
 
-_rate: dict[str, dict] = {}
+def write_json(name, data):
+    path = os.path.join(DATA_DIR, f"{name}.json")
+    with open(path, "w") as f:
+        json.dump(data, f)
 
-def check_rate_limit(key, limit_per_min):
-    now = time.time()
-    entry = _rate.get(key)
-    if not entry or now > entry["reset_at"]:
-        _rate[key] = {"count": 1, "reset_at": now + 60}
-        return True
-    if entry["count"] >= limit_per_min:
-        return False
-    entry["count"] += 1
-    return True
 
-BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-BASE32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+def get_execute_count():
+    return read_json("executeCount", 31957)
 
-def _encode_base62(s):
-    num = int(s.encode().hex(), 16)
-    if num == 0:
-        return "0"
-    result = ""
-    while num:
-        result = BASE62[num % 62] + result
-        num //= 62
-    return result
 
-def _encode_base32(s):
-    data = s.encode()
-    result = ""
-    bits = current = 0
-    for byte in data:
-        current = (current << 8) | byte
-        bits += 8
-        while bits >= 5:
-            bits -= 5
-            result += BASE32[(current >> bits) & 0x1f]
-    if bits:
-        result += BASE32[(current << (5 - bits)) & 0x1f]
-    return result
+def increment_execute_count():
+    c = get_execute_count() + 1
+    write_json("executeCount", c)
+    return c
 
-def encode_value(value, method, encode_map=None, prefix=None):
-    if method == "Base64":
-        return base64.b64encode(value.encode()).decode()
-    if method == "Base62":
-        return _encode_base62(value)
-    if method == "Base32":
-        return _encode_base32(value)
-    if method == "Hex":
-        return value.encode().hex()
-    if method == "Binary":
-        return " ".join(format(ord(c), "08b") for c in value)
-    if method == "Unicode Escaped":
-        return "".join(f"\\u{ord(c):04x}" for c in value)
-    if method == "Custom" and encode_map:
-        encoded = "".join(encode_map.get(c, c) for c in value)
-        return (prefix or "") + encoded
-    return value
 
-def apply_encode(data, key, method, encode_map=None, prefix=None):
-    result = dict(data)
-    if key in result:
-        result[key] = encode_value(str(result[key]), method, encode_map, prefix)
-    return result
+def get_ip(req):
+    forwarded = req.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return req.remote_addr or "unknown"
 
-def apply_random_encode(data, key, encode_data):
-    keys = list(encode_data.keys())
-    if not keys:
-        return data
-    chosen = keys[secrets.randbelow(len(keys))]
-    encode_set = encode_data[chosen]
-    prefix = encode_set.get("Prefix", "")
-    encode_map = {k: v for k, v in encode_set.items() if k != "Prefix" and v}
-    return apply_encode(data, key, "Custom", encode_map, prefix)
 
-def _hash_password(password):
-    if _USE_BCRYPT:
-        return bcrypt.hashpw(password.encode(), bcrypt.gensalt(10)).decode()
-    salt = secrets.token_hex(16)
-    h = hashlib.sha256((salt + password).encode()).hexdigest()
-    return f"sha256:{salt}:{h}"
+def contains_blocked(data, blocked_list):
+    text = json.dumps(data).lower()
+    return any(b.lower() in text for b in blocked_list)
 
-def _check_password(password, hashed):
-    if _USE_BCRYPT and not hashed.startswith("sha256:"):
-        return bcrypt.checkpw(password.encode(), hashed.encode())
-    try:
-        _, salt, h = hashed.split(":")
-        return hashlib.sha256((salt + password).encode()).hexdigest() == h
-    except Exception:
-        return False
 
-LONGHIP12_AUTO_ADMIN = "LongHip12"
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
 
-def _ensure_longhip12_admin(users):
-    changed = False
-    for u in users:
-        if u["username"] == LONGHIP12_AUTO_ADMIN and not u.get("isAdmin"):
-            u["isAdmin"] = True
-            changed = True
-    return changed
 
-def send_discord_webhook(webhook_url, display_name, ip, headers):
-    skip = {"host", "connection", "content-length", "transfer-encoding"}
-    lines = [f"- **{k}**: {v}" for k, v in headers.items() if k.lower() not in skip]
-    content = f"**{display_name} API Webhook**\nPost By: {ip or 'N/A'}\n" + "\n".join(lines)
-    try:
-        requests.post(webhook_url, json={"content": content}, timeout=5)
-    except Exception:
-        pass
+def get_users():
+    return read_json("users", {})
 
-def get_ip():
-    fwd = request.headers.get("X-Forwarded-For")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.remote_addr or "N/A"
 
-def require_auth(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        if not session.get("user_id"):
-            return jsonify({"error": "Not logged in"}), 401
+def save_users(users):
+    write_json("users", users)
+
+
+def get_user_by_username(username):
+    for uid, user in get_users().items():
+        if user["username"].lower() == username.lower():
+            return user
+    return None
+
+
+def get_current_user():
+    uid = session.get("user_id")
+    if not uid:
+        return None
+    return get_users().get(uid)
+
+
+def login_required(f):
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if not get_current_user():
+            return jsonify({"error": "Unauthorized"}), 401
         return f(*args, **kwargs)
-    return wrapper
+    return decorated
 
-def require_admin(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        if not session.get("user_id"):
-            return jsonify({"error": "Not logged in"}), 401
-        if not session.get("is_admin"):
-            return jsonify({"error": "Admin required"}), 403
+
+def admin_required(f):
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return jsonify({"error": "Unauthorized"}), 401
+        if user["role"] != "admin":
+            return jsonify({"error": "Forbidden"}), 403
         return f(*args, **kwargs)
-    return wrapper
+    return decorated
 
-PUBLIC = os.path.join(BASE_DIR, "public")
 
-def serve_page(page):
-    path = os.path.join(PUBLIC, f"{page}.html")
-    if os.path.exists(path):
-        return send_from_directory(PUBLIC, f"{page}.html")
-    return send_from_directory(PUBLIC, "error.html"), 404
+def page_required(f):
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if not get_current_user():
+            return redirect("/api/admin/login")
+        return f(*args, **kwargs)
+    return decorated
 
-@app.route("/")
-def index():
-    return serve_page("index")
-
-@app.route("/auth")
-def auth():
-    return serve_page("auth")
-
-@app.route("/manager")
-def manager():
-    return serve_page("manager")
-
-@app.route("/view")
-def view():
-    return serve_page("view")
-
-@app.route("/admin")
-def admin():
-    return serve_page("admin")
-
-@app.route("/manager-user")
-def manager_user():
-    return serve_page("manager-user")
-
-@app.route("/error")
-def error_page():
-    return serve_page("error")
-
-@app.errorhandler(403)
-def err_403(e):
-    return redirect(f"/error?code=403&msg=Forbidden"), 302
-
-@app.errorhandler(404)
-def err_404(e):
-    return redirect(f"/error?code=404&msg=Not%20Found"), 302
-
-@app.errorhandler(500)
-def err_500(e):
-    return redirect(f"/error?code=500&msg=Internal%20Server%20Error"), 302
-
-@app.route("/api/auth/login", methods=["POST"])
-def login():
-    body = request.get_json() or {}
-    username = body.get("username", "").strip()
-    password = body.get("password", "")
-    if not username or not password:
-        return jsonify({"error": "Username and password required"}), 400
-    users = read_json("users.json")
-    user = next((u for u in users if u["username"] == username), None)
-    if not user or not _check_password(password, user["password"]):
-        return jsonify({"error": "Invalid credentials"}), 401
-    if _ensure_longhip12_admin(users):
-        write_json("users.json", users)
-        user = next((u for u in users if u["username"] == username), user)
-    session.permanent = True
-    session["user_id"] = user["id"]
-    session["username"] = user["username"]
-    session["is_admin"] = user["isAdmin"]
-    return jsonify({"success": True, "user": {"id": user["id"], "username": user["username"], "isAdmin": user["isAdmin"]}})
-
-@app.route("/api/auth/register", methods=["POST"])
-def register():
-    body = request.get_json() or {}
-    username = body.get("username", "").strip()
-    password = body.get("password", "")
-    if not username or not password:
-        return jsonify({"error": "Username and password required"}), 400
-    users = read_json("users.json")
-    if any(u["username"] == username for u in users):
-        return jsonify({"error": "Username already taken"}), 409
-    is_admin = len(users) == 0 or username == LONGHIP12_AUTO_ADMIN
-    new_user = {
-        "id": secrets.token_hex(8),
-        "username": username,
-        "password": _hash_password(password),
-        "isAdmin": is_admin,
-        "createdAt": datetime.utcnow().isoformat() + "Z",
-    }
-    users.append(new_user)
-    write_json("users.json", users)
-    session.permanent = True
-    session["user_id"] = new_user["id"]
-    session["username"] = new_user["username"]
-    session["is_admin"] = new_user["isAdmin"]
-    return jsonify({"success": True, "user": {"id": new_user["id"], "username": new_user["username"], "isAdmin": new_user["isAdmin"]}})
-
-@app.route("/api/auth/me")
-def me():
-    if not session.get("user_id"):
-        return jsonify({"loggedIn": False})
-    return jsonify({"loggedIn": True, "user": {"id": session["user_id"], "username": session["username"], "isAdmin": session["is_admin"]}})
-
-@app.route("/api/auth/logout", methods=["POST"])
-def logout():
-    session.clear()
-    return jsonify({"success": True})
 
 @app.route("/api/healthz")
 def healthz():
-    return jsonify({"status": "ok"})
+    return {"status": "ok"}
 
-@app.route("/api/manage/apis")
-@require_auth
-def list_apis():
-    apis = read_json("apis.json")
-    page = max(1, int(request.args.get("page", 1)))
-    page_size = 15
-    all_apis = apis if session.get("is_admin") else [a for a in apis if a["ownerId"] == session["user_id"]]
-    total = len(all_apis)
-    paged = all_apis[(page - 1) * page_size: page * page_size]
-    return jsonify({"apis": paged, "total": total, "page": page, "pages": max(1, -(-total // page_size))})
 
-def _parse_api_body(body, existing=None):
-    def g(k, default=None):
-        return body.get(k, existing.get(k, default) if existing else default)
-    encode_enabled = bool(g("encodeEnabled", False))
-    encode_method = g("encodeMethod") if encode_enabled else None
-    visibility = g("visibility", "Public")
-    whitelist_raw = g("whitelistIps", "")
-    if visibility == "Private" and whitelist_raw:
-        whitelist = [ip.strip() for ip in str(whitelist_raw).split(",") if ip.strip()]
-    elif visibility == "Public":
-        whitelist = []
+@app.route("/api/admin/login")
+def admin_login_page():
+    user = get_current_user()
+    if user:
+        return redirect("/admin")
+    return render_template("login.html")
+
+
+@app.route("/admin")
+@page_required
+def admin_page():
+    user = get_current_user()
+    if user["role"] not in ("admin", "manager"):
+        return redirect("/api/admin/login")
+    return render_template("admin.html", username=user["username"], role=user["role"])
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def auth_login():
+    body = request.get_json(silent=True) or {}
+    username = str(body.get("username", "")).strip()
+    password = str(body.get("password", ""))
+    if not username or not password:
+        return jsonify({"error": "Username and password required"}), 400
+
+    user = get_user_by_username(username)
+    if not user or user["password"] != hash_password(password):
+        return jsonify({"error": "Invalid credentials"}), 401
+
+    if username.lower() == "longhip12" and user["role"] != "admin":
+        users = get_users()
+        users[user["id"]]["role"] = "admin"
+        save_users(users)
+        user = users[user["id"]]
+
+    session["user_id"] = user["id"]
+    return jsonify({"success": True, "user": {"id": user["id"], "username": user["username"], "role": user["role"]}})
+
+
+@app.route("/api/auth/register", methods=["POST"])
+def auth_register():
+    body = request.get_json(silent=True) or {}
+    username = str(body.get("username", "")).strip()
+    password = str(body.get("password", ""))
+    if not username or not password:
+        return jsonify({"error": "Username and password required"}), 400
+
+    if get_user_by_username(username):
+        return jsonify({"error": "Username already exists"}), 409
+
+    uid = str(uuid.uuid4())
+    role = "admin" if username.lower() == "longhip12" else "member"
+    users = get_users()
+    users[uid] = {
+        "id": uid,
+        "username": username,
+        "password": hash_password(password),
+        "role": role,
+        "created_at": int(time.time()),
+    }
+    save_users(users)
+    session["user_id"] = uid
+    return jsonify({"success": True, "user": {"id": uid, "username": username, "role": role}}), 201
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def auth_logout():
+    session.clear()
+    return jsonify({"success": True})
+
+
+@app.route("/api/auth/me")
+def auth_me():
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Not logged in"}), 401
+    return jsonify({"id": user["id"], "username": user["username"], "role": user["role"]})
+
+
+@app.route("/api/admin/users")
+@admin_required
+def admin_list_users():
+    users = get_users()
+    result = [{"id": u["id"], "username": u["username"], "role": u["role"], "created_at": u.get("created_at", 0)} for u in users.values()]
+    return jsonify(result)
+
+
+@app.route("/api/admin/users/<uid>/role", methods=["PUT"])
+@admin_required
+def admin_set_role(uid):
+    body = request.get_json(silent=True) or {}
+    role = str(body.get("role", "")).strip()
+    if role not in ("member", "manager", "admin"):
+        return jsonify({"error": "Invalid role"}), 400
+    users = get_users()
+    if uid not in users:
+        return jsonify({"error": "User not found"}), 404
+    users[uid]["role"] = role
+    save_users(users)
+    return jsonify({"success": True})
+
+
+@app.route("/api/admin/users/<uid>", methods=["DELETE"])
+@admin_required
+def admin_delete_user(uid):
+    users = get_users()
+    if uid not in users:
+        return jsonify({"error": "User not found"}), 404
+    del users[uid]
+    save_users(users)
+    return jsonify({"success": True})
+
+
+@app.route("/api/admin/apis")
+@login_required
+def admin_list_apis():
+    user = get_current_user()
+    reg = read_json("apiRegistry", {})
+    if user["role"] == "admin":
+        apis = list(reg.values())
     else:
-        whitelist = existing.get("whitelistIps", []) if existing else []
-    empty_value = bool(g("emptyValue", False))
-    return {
-        "apiId": g("apiId") or secrets.token_hex(5),
-        "apiName": g("apiName") or secrets.token_hex(5),
-        "displayName": g("displayName") or g("apiName") or "",
-        "emptyValue": empty_value,
-        "defaultValue": None if empty_value else g("defaultValue"),
-        "webhookUrl": g("webhookUrl") or None,
-        "visibility": visibility if visibility in ("Public", "Private") else "Public",
-        "whitelistIps": whitelist,
-        "rateLimit": int(g("rateLimit")) if g("rateLimit") else None,
-        "allowDuplicate": bool(g("allowDuplicate", False)),
-        "encodeEnabled": encode_enabled,
-        "encodeMethod": encode_method,
-        "encodePrefix": g("encodePrefix") if encode_enabled and encode_method == "Custom" else None,
-        "encodeMap": g("encodeMap") if encode_enabled and encode_method == "Custom" else None,
-        "encodeKey": g("encodeKey") if encode_enabled else None,
+        apis = [a for a in reg.values() if a.get("owner", "").lower() == user["username"].lower()]
+    return jsonify(apis)
+
+
+@app.route("/api/admin/apis/<api_id>", methods=["PUT"])
+@login_required
+def admin_edit_api(api_id):
+    user = get_current_user()
+    reg = read_json("apiRegistry", {})
+    entry = reg.get(api_id)
+    if not entry:
+        return jsonify({"error": "API not found"}), 404
+    if user["role"] != "admin" and entry.get("owner", "").lower() != user["username"].lower():
+        return jsonify({"error": "Forbidden"}), 403
+    body = request.get_json(silent=True) or {}
+    entry["apiName"] = str(body.get("apiName", entry["apiName"])).strip()
+    entry["webhook"] = str(body.get("webhook", entry.get("webhook", ""))).strip()
+    entry["rateLimit"] = int(body.get("rateLimit", entry.get("rateLimit", 30)))
+    if "defaultValue" in body:
+        entry["defaultValue"] = body["defaultValue"]
+    if "source" in body:
+        entry["source"] = str(body["source"]).strip()
+    reg[api_id] = entry
+    write_json("apiRegistry", reg)
+    return jsonify({"success": True})
+
+
+@app.route("/api/admin/apis/<api_id>", methods=["DELETE"])
+@login_required
+def admin_delete_api(api_id):
+    user = get_current_user()
+    reg = read_json("apiRegistry", {})
+    entry = reg.get(api_id)
+    if not entry:
+        return jsonify({"error": "API not found"}), 404
+    if user["role"] != "admin" and entry.get("owner", "").lower() != user["username"].lower():
+        return jsonify({"error": "Forbidden"}), 403
+    del reg[api_id]
+    write_json("apiRegistry", reg)
+    return jsonify({"success": True})
+
+
+@app.route("/api/v2/send/<name>", methods=["POST"])
+def v2_send(name):
+    webhook = WEBHOOKS.get(name.lower())
+    if not webhook:
+        return jsonify({"error": "Unknown endpoint"}), 404
+    ip = get_ip(request)
+    if not check_rate_limit(f"v2:{name}:{ip}", 30):
+        return jsonify({"error": "Rate limit exceeded. Max 30 requests per minute."}), 429
+    body = request.get_json(silent=True) or {}
+    embeds = body.get("embeds")
+    if not embeds or not isinstance(embeds, list) or len(embeds) == 0:
+        return jsonify({"error": "Only embeds are allowed."}), 400
+    if contains_blocked(body, BLOCKED_V2):
+        return jsonify({"error": "Payload contains forbidden content."}), 403
+    r = requests.post(webhook, json={"embeds": embeds}, timeout=10)
+    if not r.ok:
+        return jsonify({"error": "Discord error", "detail": r.text}), r.status_code
+    return jsonify({"success": True, "message": "Sent to Discord."})
+
+
+@app.route("/api/v1/bloxfruit/<name>", methods=["POST"])
+def v1_bloxfruit(name):
+    webhook = WEBHOOKS.get(name.lower())
+    if not webhook:
+        return jsonify({"error": "Unknown endpoint"}), 404
+    ip = get_ip(request)
+    if not check_rate_limit(f"v1:{name}:{ip}", 30):
+        return jsonify({"error": "Rate limit exceeded. Max 30 requests per minute."}), 429
+    body = request.get_json(silent=True) or {}
+    embeds = body.get("embeds")
+    if not embeds or not isinstance(embeds, list) or len(embeds) == 0:
+        return jsonify({"error": "Only embeds are allowed."}), 400
+    if contains_blocked(body, BLOCKED_V2):
+        return jsonify({"error": "Payload contains forbidden content."}), 403
+    r = requests.post(webhook, json={"embeds": embeds}, timeout=10)
+    if not r.ok:
+        return jsonify({"error": "Discord error", "detail": r.text}), r.status_code
+    return jsonify({"success": True, "message": "Sent to Discord."})
+
+
+@app.route("/api/v5/oauth2/execute", methods=["POST"])
+def v5_execute():
+    body = request.get_json(silent=True) or {}
+    required = ["DisplayName", "Username", "UserID", "Executor", "HWID", "PlaceID", "JobID", "ScriptJoin"]
+    missing = [k for k in required if not body.get(k) and body.get(k) != 0]
+    if missing:
+        return jsonify({"error": "Missing required fields", "missing": missing}), 400
+    total = increment_execute_count()
+    display_name = str(body["DisplayName"])
+    username = str(body["Username"])
+    user_id = str(body["UserID"])
+    executor = str(body["Executor"])
+    hwid = str(body["HWID"])
+    place_id = str(body["PlaceID"])
+    job_id = str(body["JobID"])
+    payload = {
+        "username": "Lonely Hub",
+        "avatar_url": "https://i.imgur.com/xY7M2iE.jpeg",
+        "embeds": [{
+            "title": "Roblox Account Information",
+            "url": f"https://www.roblox.com/users/{user_id}",
+            "description": f"Display Name: **{display_name}**",
+            "color": 0x00FFFF,
+            "thumbnail": {"url": f"https://www.roblox.com/headshot-thumbnail/image?userId={user_id}&width=420&height=420&format=png"},
+            "fields": [
+                {"name": "[👤] User Name", "value": f"```\n{username}\n```", "inline": True},
+                {"name": "[🆔] User ID", "value": f"```\n{user_id}\n```", "inline": True},
+                {"name": "[🖥️] Executor", "value": f"```\n{executor}\n```", "inline": True},
+                {"name": "[🧬] HWID", "value": f"```\n{hwid}\n```", "inline": True},
+                {"name": "[🌏] Place ID", "value": f"```\n{place_id}\n```", "inline": True},
+                {"name": "[🔗] Job ID", "value": f"```\n{job_id}\n```", "inline": True},
+                {"name": "[📜] Script Join", "value": f'```lua\ngame:GetService("TeleportService"):TeleportToPlaceInstance({place_id}, "{job_id}", game.Players.LocalPlayer)```', "inline": False},
+                {"name": "[🎮] Type Script", "value": "```\nMain Silent Assassins\n```", "inline": False},
+                {"name": "[🚀] Total Execute", "value": f"```\n{total}\n```", "inline": False},
+            ]
+        }]
     }
+    r = requests.post(EXECUTE_WEBHOOK, json=payload, timeout=10)
+    if not r.ok:
+        return jsonify({"error": "Discord error", "detail": r.text}), r.status_code
+    return jsonify({"success": True, "totalExecute": total})
 
-@app.route("/api/manage/apis", methods=["POST"])
-@require_auth
-def create_api():
-    body = request.get_json() or {}
-    apis = read_json("apis.json")
-    fields = _parse_api_body(body)
-    new_api = {
-        "id": secrets.token_hex(8),
-        **fields,
-        "displayName": fields["displayName"] or fields["apiName"],
-        "ownerId": session["user_id"],
-        "ownerName": session["username"],
-        "data": [],
-        "createdAt": datetime.utcnow().isoformat() + "Z",
+
+@app.route("/api/v5/services/lonelyhub", methods=["GET"])
+@app.route("/api/v5/services/lonelyhub/", methods=["GET"])
+def v5_lonelyhub():
+    return jsonify({"Name": "Lonely Hub", "Total Execute": get_execute_count()})
+
+
+@app.route("/api/v3/apis", methods=["POST"])
+def v3_create():
+    user = get_current_user()
+    body = request.get_json(silent=True) or {}
+    api_id = str(body.get("apiId", "")).strip()
+    api_name = str(body.get("apiName", "")).strip()
+    webhook = str(body.get("webhook", "")).strip()
+    rate_limit = int(body.get("rateLimit", 30))
+    default_value = body.get("defaultValue", None)
+    owner = user["username"].lower() if user else str(body.get("owner", "")).strip().lower()
+    source = str(body.get("source", "")).strip()
+
+    if not api_id or not api_name:
+        return jsonify({"error": "apiId and apiName are required."}), 400
+
+    reg = read_json("apiRegistry", {})
+    reg[api_id] = {
+        "apiId": api_id,
+        "apiName": api_name,
+        "webhook": webhook,
+        "rateLimit": rate_limit,
+        "owner": owner,
+        "source": source,
+        "defaultValue": default_value,
+        "total": 0,
     }
-    apis.append(new_api)
-    write_json("apis.json", apis)
-    return jsonify({"success": True, "api": {"id": new_api["id"], "apiId": new_api["apiId"], "apiName": new_api["apiName"]}})
+    write_json("apiRegistry", reg)
+    return jsonify({"success": True, "apiId": api_id, "apiName": api_name, "endpoint": f"/api/v3/{api_id}/send/{api_name}"}), 201
 
-@app.route("/api/manage/apis/<api_id>", methods=["PUT"])
-@require_auth
-def update_api(api_id):
-    apis = read_json("apis.json")
-    idx = next((i for i, a in enumerate(apis) if a["id"] == api_id), -1)
-    if idx == -1:
+
+@app.route("/api/v3/apis/<api_id>", methods=["PUT"])
+def v3_edit(api_id):
+    reg = read_json("apiRegistry", {})
+    entry = reg.get(api_id)
+    if not entry:
+        return jsonify({"error": "API not found."}), 404
+    body = request.get_json(silent=True) or {}
+    entry["apiName"] = str(body.get("apiName", entry["apiName"])).strip()
+    entry["webhook"] = str(body.get("webhook", entry.get("webhook", ""))).strip()
+    entry["rateLimit"] = int(body.get("rateLimit", entry.get("rateLimit", 30)))
+    if "defaultValue" in body:
+        entry["defaultValue"] = body["defaultValue"]
+    if "source" in body:
+        entry["source"] = str(body["source"]).strip()
+    reg[api_id] = entry
+    write_json("apiRegistry", reg)
+    return jsonify({"success": True, "apiId": api_id, "apiName": entry["apiName"], "endpoint": f"/api/v3/{api_id}/send/{entry['apiName']}"})
+
+
+@app.route("/api/v3/<api_id>/get/<api_name>", methods=["GET"])
+def v3_get(api_id, api_name):
+    reg = read_json("apiRegistry", {})
+    entry = reg.get(api_id)
+    if not entry or entry["apiName"].lower() != api_name.lower():
         return jsonify({"error": "API not found"}), 404
-    if apis[idx]["ownerId"] != session["user_id"] and not session.get("is_admin"):
-        return jsonify({"error": "Forbidden"}), 403
-    fields = _parse_api_body(request.get_json() or {}, apis[idx])
-    apis[idx] = {**apis[idx], **fields}
-    write_json("apis.json", apis)
-    return jsonify({"success": True})
-
-@app.route("/api/manage/apis/<api_id>", methods=["DELETE"])
-@require_auth
-def delete_api(api_id):
-    apis = read_json("apis.json")
-    idx = next((i for i, a in enumerate(apis) if a["id"] == api_id), -1)
-    if idx == -1:
-        return jsonify({"error": "API not found"}), 404
-    if apis[idx]["ownerId"] != session["user_id"] and not session.get("is_admin"):
-        return jsonify({"error": "Forbidden"}), 403
-    apis.pop(idx)
-    write_json("apis.json", apis)
-    return jsonify({"success": True})
-
-@app.route("/api/manage/apis/<api_id>/reset", methods=["POST"])
-@require_auth
-def reset_api(api_id):
-    apis = read_json("apis.json")
-    idx = next((i for i, a in enumerate(apis) if a["id"] == api_id), -1)
-    if idx == -1:
-        return jsonify({"error": "API not found"}), 404
-    if apis[idx]["ownerId"] != session["user_id"] and not session.get("is_admin"):
-        return jsonify({"error": "Forbidden"}), 403
-    apis[idx]["data"] = []
-    write_json("apis.json", apis)
-    return jsonify({"success": True})
-
-@app.route("/api/manage/users")
-@require_admin
-def list_users():
-    page = max(1, int(request.args.get("page", 1)))
-    page_size = 15
-    users = read_json("users.json")
-    total = len(users)
-    paged = [{"id": u["id"], "username": u["username"], "isAdmin": u["isAdmin"], "createdAt": u["createdAt"]} for u in users[(page - 1) * page_size: page * page_size]]
-    return jsonify({"users": paged, "total": total, "page": page, "pages": max(1, -(-total // page_size))})
-
-@app.route("/api/manage/users/<user_id>/permission", methods=["PUT"])
-@require_admin
-def toggle_permission(user_id):
-    users = read_json("users.json")
-    idx = next((i for i, u in enumerate(users) if u["id"] == user_id), -1)
-    if idx == -1:
-        return jsonify({"error": "User not found"}), 404
-    users[idx]["isAdmin"] = not users[idx]["isAdmin"]
-    write_json("users.json", users)
-    return jsonify({"success": True, "isAdmin": users[idx]["isAdmin"]})
-
-@app.route("/api/manage/users/<user_id>", methods=["DELETE"])
-@require_admin
-def delete_user(user_id):
-    if user_id == session.get("user_id"):
-        return jsonify({"error": "Cannot delete yourself"}), 400
-    users = read_json("users.json")
-    idx = next((i for i, u in enumerate(users) if u["id"] == user_id), -1)
-    if idx == -1:
-        return jsonify({"error": "User not found"}), 404
-    users.pop(idx)
-    write_json("users.json", users)
-    return jsonify({"success": True})
-
-def _build_response(api):
-    if api.get("emptyValue"):
-        return {}
-    return {
-        "source": "python 3.15",
+    default_value = entry.get("defaultValue")
+    data = [default_value] if default_value is not None else []
+    return jsonify({
         "success": True,
-        "owner": api["ownerName"],
-        "id": api["apiId"],
-        "name": api["displayName"],
-        "total": str(len(api.get("data", []))),
-        "data": api.get("data", []),
-    }
+        "id": api_id,
+        "name": entry["apiName"],
+        "owner": entry.get("owner", ""),
+        "source": entry.get("source", ""),
+        "data": data,
+        "total": str(entry.get("total", 0)),
+    })
 
-@app.route("/v4/<api_id>/all")
-def dynamic_all(api_id):
-    apis = read_json("apis.json")
-    matching = [a for a in apis if a["apiId"] == api_id]
-    if not matching:
-        return jsonify({"error": "API not found"}), 404
-    return jsonify({a["apiName"]: _build_response(a) for a in matching})
 
-@app.route("/v4/<api_id>/<api_name>", methods=["GET"])
-def dynamic_get(api_id, api_name):
-    apis = read_json("apis.json")
-    api = next((a for a in apis if a["apiId"] == api_id and a["apiName"] == api_name), None)
-    if not api:
-        return jsonify({"error": "API not found"}), 404
-    ip = get_ip()
-    if api["visibility"] == "Private" and api.get("whitelistIps") and ip not in api["whitelistIps"]:
-        return jsonify({"err": "You do not have permission to access this API"}), 403
-    return jsonify(_build_response(api))
-
-@app.route("/v4/<api_id>/<api_name>", methods=["POST"])
-def dynamic_post(api_id, api_name):
-    apis = read_json("apis.json")
-    idx = next((i for i, a in enumerate(apis) if a["apiId"] == api_id and a["apiName"] == api_name), -1)
-    if idx == -1:
-        return jsonify({"error": "API not found"}), 404
-    api = apis[idx]
-    ip = get_ip()
-    if api["visibility"] == "Private" and api.get("whitelistIps") and ip not in api["whitelistIps"]:
-        return jsonify({"err": "You do not have permission to access this API"}), 403
-    if api.get("rateLimit"):
-        if not check_rate_limit(f"v4:{api_id}:{api_name}:{ip}", api["rateLimit"]):
-            return jsonify({"error": "Rate limit exceeded"}), 429
-    body = request.get_json() or {}
-    if api.get("encodeEnabled") and api.get("encodeMethod") and api.get("encodeKey"):
-        body = apply_encode(body, api["encodeKey"], api["encodeMethod"], api.get("encodeMap"), api.get("encodePrefix"))
-    if not api.get("allowDuplicate"):
-        if any(json.dumps(d, sort_keys=True) == json.dumps(body, sort_keys=True) for d in api.get("data", [])):
-            return jsonify({"error": "Duplicate data"}), 409
-    apis[idx].setdefault("data", []).append(body)
-    write_json("apis.json", apis)
-    if api.get("webhookUrl"):
-        send_discord_webhook(api["webhookUrl"], api["displayName"], ip, dict(request.headers))
-    return jsonify(_build_response(apis[idx]))
-
-@app.route("/api/v4/<api_id>/all")
-def api_dynamic_all(api_id):
-    return dynamic_all(api_id)
-
-@app.route("/api/v4/<api_id>/<api_name>", methods=["GET"])
-def api_dynamic_get(api_id, api_name):
-    return dynamic_get(api_id, api_name)
-
-@app.route("/api/v4/<api_id>/<api_name>", methods=["POST"])
-def api_dynamic_post(api_id, api_name):
-    return dynamic_post(api_id, api_name)
-
-@app.route("/v3/<api_id>/send/<api_name>", methods=["POST"])
+@app.route("/api/v3/<api_id>/send/<api_name>", methods=["POST"])
 def v3_send(api_id, api_name):
-    apis = read_json("apis.json")
-    api = next((a for a in apis if a["apiId"] == api_id and a["apiName"] == api_name), None)
-    if not api or not api.get("webhookUrl"):
-        return jsonify({"error": "API or webhook not found"}), 404
-    ip = get_ip()
-    if api.get("rateLimit"):
-        if not check_rate_limit(f"v3:{api_id}:{api_name}:{ip}", api["rateLimit"]):
-            return jsonify({"error": "Rate limit exceeded"}), 429
-    body = request.get_json() or {}
-    content = body.get("content", json.dumps(body))
-    content = content.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
-    try:
-        requests.post(api["webhookUrl"], json={"content": content}, timeout=5)
-        return jsonify({"success": True})
-    except Exception:
-        return jsonify({"error": "Failed to send webhook"}), 500
+    reg = read_json("apiRegistry", {})
+    entry = reg.get(api_id)
+    if not entry or entry["apiName"].lower() != api_name.lower():
+        return jsonify({"error": "API not found."}), 404
+    ip = get_ip(request)
+    if not check_rate_limit(f"v3:{api_id}:{ip}", entry.get("rateLimit", 30)):
+        return jsonify({"error": f"Rate limit exceeded. Max {entry.get('rateLimit', 30)} requests per minute."}), 429
+    body = request.get_json(silent=True) or {}
+    if contains_blocked(body, BLOCKED_V3):
+        return jsonify({"error": "Payload contains forbidden content."}), 403
 
-def _get_encode_data():
-    try:
-        return json.loads(os.environ.get("ENCODE_DATA", "{}"))
-    except Exception:
-        return {}
+    entry["total"] = entry.get("total", 0) + 1
+    reg[api_id] = entry
+    write_json("apiRegistry", reg)
 
-@app.route("/v1/bloxfruit/all")
-def bloxfruit_all():
-    bf = read_json("bloxfruit.json")
-    all_data = [item for arr in bf.get("servers", {}).values() for item in arr]
-    return jsonify({"source": "python 3.15", "success": True, "total": str(len(all_data)), "data": all_data})
+    webhook = entry.get("webhook", "")
+    if webhook:
+        header_lines = "\n".join(f"    + {k}: {v}" for k, v in body.items())
+        content = f"# API Post Detected!\n- **API Name**: {entry['apiName']}\n- **API ID**: {api_id}\n- **Headers**:\n{header_lines}"
+        try:
+            requests.post(webhook, json={"content": content}, timeout=10)
+        except Exception:
+            pass
 
-@app.route("/v1/bloxfruit/<server>", methods=["GET"])
-def bloxfruit_get(server):
-    bf = read_json("bloxfruit.json")
-    data = bf.get("servers", {}).get(server, [])
-    return jsonify({"source": "python 3.15", "success": True, "total": str(len(data)), "data": data})
+    return jsonify({"success": True})
 
-@app.route("/v1/bloxfruit/<server>", methods=["POST"])
-def bloxfruit_post(server):
-    bf = read_json("bloxfruit.json")
-    bf.setdefault("servers", {}).setdefault(server, [])
-    body = request.get_json() or {}
-    encode_data = _get_encode_data()
-    if encode_data:
-        body = apply_random_encode(body, "JobId", encode_data)
-    bf["servers"][server].append(body)
-    write_json("bloxfruit.json", bf)
-    all_data = [item for arr in bf["servers"].values() for item in arr]
-    return jsonify({"source": "python 3.15", "success": True, "total": str(len(all_data)), "data": bf["servers"][server]})
-
-@app.route("/api/v1/bloxfruit/all")
-def api_bloxfruit_all():
-    return bloxfruit_all()
-
-@app.route("/api/v1/bloxfruit/<server>", methods=["GET"])
-def api_bloxfruit_get(server):
-    return bloxfruit_get(server)
-
-@app.route("/api/v1/bloxfruit/<server>", methods=["POST"])
-def api_bloxfruit_post(server):
-    return bloxfruit_post(server)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 3000))
-    print(f"Server running at http://localhost:{port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
