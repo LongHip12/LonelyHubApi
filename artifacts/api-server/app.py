@@ -11,24 +11,14 @@ from flask import Flask, request, jsonify, session, redirect, render_template
 app = Flask(__name__, static_url_path='/api/static')
 app.secret_key = os.environ.get("SESSION_SECRET", "lonelyhub-secret-2024")
 
-WEBHOOKS = {
-    "mirage": "https://discord.com/api/webhooks/1513404305325953055/tbj3rwOS_51utpyqnlSMTQATkA2iY2xlOSc3ZfnngqpGrFmyBl2e8yWhtVs9KO996dNq",
-    "prehistoric": "https://discord.com/api/webhooks/1513404845024083998/8XYS6f5qT2DtEhKVUx46LC2tGhTOQwgk3kCsvNLnVBoDTkK6P9-FcnHw7QflO3NBiIpD",
-    "kitsune": "https://discord.com/api/webhooks/1513405002138386432/ok5BqNmL5ppcQJLTfbwjrH52FcsUdYFuiVro83YeCfWnU-Jwi4zpgcXXVYPsl_vR8OHL",
-    "fullmoon": "https://discord.com/api/webhooks/1513405097747546182/jtrsHlyZmrwofPPiMplTzgwgWYcW5cSjfEZfTA4nMenyxh92mBxaIGejPP7GQmx1x6K_",
-    "nearmoon": "https://discord.com/api/webhooks/1513405176466116711/YRDfrcRky6nyZPpaABXDt-RUDxR0itaWKAoCmAjSCyAsXrMgL61lRyFsVhlW1Laj42dV",
-    "ripindra": "https://discord.com/api/webhooks/1513405295676756038/DpRkeOhzq7UfKE0JiLFzpzVGJZTZF_DpnhAi_Nv0abEwrUN4I9kK_DG4dZiBAB-bOoOC",
-    "doughking": "https://discord.com/api/webhooks/1513405365545472070/_Cqy7jwKBr9DwCBum8mu7UEf3P-2Biq4aXwfCGSSAZCDspDljY60TJSa8BpXfLQknXWx",
-    "katakuri": "https://discord.com/api/webhooks/1513405454577959083/YdDrA5o4_kSSJD3ALoG0gmafphsokXoo4VdSK4c28UTU8ZBjVOK1waTEBzoIQnbtY6hs",
-    "tyrant": "https://discord.com/api/webhooks/1513405533858697277/pbaTKeGDhVFsTIneeLpMojloFRHYyDagI4EtQ1AX-79pEgLstUgfNtRlk55NOaXlZZR-",
-    "darkbeard": "https://discord.com/api/webhooks/1513405620789710878/YCeG3r2Bwv_i_3vvKFsYUgZ_rr4FomFiCSB3oaco0_i4CitD6JCGV91ymBht--ig6dge",
-    "soulreaper": "https://discord.com/api/webhooks/1513405697692401705/sasrbmrq03Fy8KQn19iWccGu1Wwpegf5d5KrFGiNNm4Rbw9Qrl5jMWsG_zprNwmdqpuq",
-    "cursedcaptain": "https://discord.com/api/webhooks/1513405788360806480/6Jzv4Ywvc7YIF8vOsL73hqQ5CZfnMEyB32eDwHr8v9flCz8vn-vrH3Ozy5htt3HrppL9",
-    "swordlegendary": "https://discord.com/api/webhooks/1513405894208127016/tOL0AyzKhN3Ef3B5dTQF3OV9mkxmUSQDbjzoY8S0fO0Um-b_FWRuClkCI7AtLERk9oxZ",
-    "hakilegendary": "https://discord.com/api/webhooks/1513405968405368982/GHyo--6s8dZadjw-hVOJzpCGxWsdmAWamzLvW9pmH1LmxH7jnRaZxQPaJKJqVph6XLts",
-}
+_wh_raw = os.environ.get("WEBHOOKS_JSON", "{}")
+try:
+    _wh_data = json.loads(_wh_raw)
+except Exception:
+    _wh_data = {}
 
-EXECUTE_WEBHOOK = "https://discord.com/api/webhooks/1513412624979591230/WxEwthKabsfJmqVYfGJCJ2S69rKPmXhIbxs-nlk0rEbP2GiV1F6fTXgIOBtFhmLoL2vG"
+WEBHOOKS = {k: v for k, v in _wh_data.items() if k != "__execute__"}
+EXECUTE_WEBHOOK = _wh_data.get("__execute__", "")
 BLOCKED_V2 = ["@everyone", "@here", "spam", "spammed", "raidded", "@"]
 BLOCKED_V3 = ["@everyone", "@here"]
 
