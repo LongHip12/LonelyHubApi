@@ -683,6 +683,27 @@ def v2_send(name):
     return jsonify({"success": True, "message": "Sent to Discord."})
 
 
+@app.route("/api/v1/<name>", methods=["GET"])
+def v1_get(name):
+    reg = get_registry()
+    matches = [e for e in reg.values() if e["apiName"].lower() == name.lower()]
+    if not matches:
+        return jsonify({"error": "API not found"}), 404
+    entry = matches[0]
+    ip = get_ip(request)
+    if entry.get("visibility") == "Private":
+        whitelist = entry.get("whitelistIps", [])
+        if whitelist and ip not in whitelist:
+            return jsonify({"error": "Access denied"}), 403
+    rate = entry.get("rateLimit")
+    if rate and not check_rate_limit(f"v1:get:{name}:{ip}", rate):
+        return jsonify({"error": f"Rate limit exceeded. Max {rate} req/min"}), 429
+    data = entry.get("data", [])
+    if not data and not entry.get("emptyValue") and entry.get("defaultValue") is not None:
+        data = [entry["defaultValue"]]
+    return jsonify({"success": True, "apiId": entry["apiId"], "apiName": entry["apiName"], "data": data})
+
+
 @app.route("/api/v1/bloxfruit/<name>", methods=["POST"])
 def v1_bloxfruit(name):
     webhook = WEBHOOKS.get(name.lower())
