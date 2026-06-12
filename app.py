@@ -683,13 +683,12 @@ def v2_send(name):
     return jsonify({"success": True, "message": "Sent to Discord."})
 
 
-@app.route("/api/v1/<name>", methods=["GET"])
-def v1_get(name):
+def _v1_lookup_and_return(name):
+    ip = get_ip(request)
     reg = get_registry()
-    matches = [e for e in reg.values() if e["apiName"].lower() == name.lower()]
+    matches = [e for e in reg.values() if e["apiName"].lower() == name.lower() or e["apiId"].lower() == name.lower()]
     if matches:
         entry = matches[0]
-        ip = get_ip(request)
         if entry.get("visibility") == "Private":
             whitelist = entry.get("whitelistIps", [])
             if whitelist and ip not in whitelist:
@@ -703,15 +702,22 @@ def v1_get(name):
         return jsonify({"success": True, "apiId": entry["apiId"], "apiName": entry["apiName"], "data": data})
     old_reg = read_json("apiRegistry", {})
     for api_id, entry in old_reg.items():
-        if entry.get("apiName", "").lower() == name.lower():
+        if entry.get("apiName", "").lower() == name.lower() or api_id.lower() == name.lower():
             default_value = entry.get("defaultValue")
             data = [default_value] if default_value is not None else []
             return jsonify({"success": True, "apiId": api_id, "apiName": entry["apiName"], "data": data})
     return jsonify({"error": "API not found"}), 404
 
 
-@app.route("/api/v1/bloxfruit/<name>", methods=["POST"])
+@app.route("/api/v1/<name>", methods=["GET"])
+def v1_get(name):
+    return _v1_lookup_and_return(name)
+
+
+@app.route("/api/v1/bloxfruit/<name>", methods=["GET", "POST"])
 def v1_bloxfruit(name):
+    if request.method == "GET":
+        return _v1_lookup_and_return(name)
     webhook = WEBHOOKS.get(name.lower())
     if not webhook:
         return jsonify({"error": "Unknown endpoint"}), 404
