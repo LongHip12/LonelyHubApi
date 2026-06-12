@@ -687,21 +687,27 @@ def v2_send(name):
 def v1_get(name):
     reg = get_registry()
     matches = [e for e in reg.values() if e["apiName"].lower() == name.lower()]
-    if not matches:
-        return jsonify({"error": "API not found"}), 404
-    entry = matches[0]
-    ip = get_ip(request)
-    if entry.get("visibility") == "Private":
-        whitelist = entry.get("whitelistIps", [])
-        if whitelist and ip not in whitelist:
-            return jsonify({"error": "Access denied"}), 403
-    rate = entry.get("rateLimit")
-    if rate and not check_rate_limit(f"v1:get:{name}:{ip}", rate):
-        return jsonify({"error": f"Rate limit exceeded. Max {rate} req/min"}), 429
-    data = entry.get("data", [])
-    if not data and not entry.get("emptyValue") and entry.get("defaultValue") is not None:
-        data = [entry["defaultValue"]]
-    return jsonify({"success": True, "apiId": entry["apiId"], "apiName": entry["apiName"], "data": data})
+    if matches:
+        entry = matches[0]
+        ip = get_ip(request)
+        if entry.get("visibility") == "Private":
+            whitelist = entry.get("whitelistIps", [])
+            if whitelist and ip not in whitelist:
+                return jsonify({"error": "Access denied"}), 403
+        rate = entry.get("rateLimit")
+        if rate and not check_rate_limit(f"v1:get:{name}:{ip}", rate):
+            return jsonify({"error": f"Rate limit exceeded. Max {rate} req/min"}), 429
+        data = entry.get("data", [])
+        if not data and not entry.get("emptyValue") and entry.get("defaultValue") is not None:
+            data = [entry["defaultValue"]]
+        return jsonify({"success": True, "apiId": entry["apiId"], "apiName": entry["apiName"], "data": data})
+    old_reg = read_json("apiRegistry", {})
+    for api_id, entry in old_reg.items():
+        if entry.get("apiName", "").lower() == name.lower():
+            default_value = entry.get("defaultValue")
+            data = [default_value] if default_value is not None else []
+            return jsonify({"success": True, "apiId": api_id, "apiName": entry["apiName"], "data": data})
+    return jsonify({"error": "API not found"}), 404
 
 
 @app.route("/api/v1/bloxfruit/<name>", methods=["POST"])
