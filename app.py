@@ -139,7 +139,10 @@ def page_required(f):
 
 @app.route("/")
 def index():
-    return redirect("/api/admin/login")
+    user = get_current_user()
+    if user:
+        return redirect("/admin")
+    return render_template("login.html")
 
 
 @app.route("/api")
