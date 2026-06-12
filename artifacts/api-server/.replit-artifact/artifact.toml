@@ -7,15 +7,15 @@ id = "3B4_FFSkEVBkAeYMFRJ2e"
 [[services]]
 localPort = 8080
 name = "API Server"
-paths = ["/api", "/admin"]
+paths = ["/api", "/admin", "/"]
 
 [services.development]
-run = "python3 app.py"
+run = "gunicorn --bind 0.0.0.0:8080 --reload --workers 1 --chdir /home/runner/workspace app:app"
 
 [services.production]
 
 [services.production.run]
-args = ["python3", "app.py"]
+args = ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--chdir", "/home/runner/workspace", "app:app"]
 
 [services.production.run.env]
 PORT = "8080"

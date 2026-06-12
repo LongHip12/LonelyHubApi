@@ -137,9 +137,20 @@ def page_required(f):
     return decorated
 
 
+@app.route("/")
+def index():
+    return redirect("/api/admin/login")
+
+
+@app.route("/api")
+@app.route("/api/")
+def api_index():
+    return jsonify({"name": "Lonely Hub API", "status": "ok", "totalExecute": get_execute_count()})
+
+
 @app.route("/api/healthz")
 def healthz():
-    return {"status": "ok"}
+    return jsonify({"status": "ok"})
 
 
 @app.route("/api/admin/login")
